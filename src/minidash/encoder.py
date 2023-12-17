@@ -36,7 +36,7 @@ _ENCODER_CMD = [
 ]
 
 
-async def frames(frames_dir: Path) -> AsyncIterator[np.ndarray]:
+async def _frames(frames_dir: Path) -> AsyncIterator[np.ndarray]:
 
     frame_names = sorted(os.listdir(frames_dir))
     delta = timedelta(seconds=1 / DESIRED_FPS)
@@ -51,7 +51,7 @@ async def frames(frames_dir: Path) -> AsyncIterator[np.ndarray]:
                 await asyncio.sleep((delta - elapsed).total_seconds())
 
 
-async def atoms(output: IO) -> AsyncIterator[tuple[bytes, bytes]]:
+async def _atoms(output: IO) -> AsyncIterator[tuple[bytes, bytes]]:
     while output.readable():
         atom_size_bytes, atom_type = await asyncio.to_thread(output.read, 4), await asyncio.to_thread(output.read, 4)
         atom_size = int.from_bytes(atom_size_bytes, "big")
@@ -69,16 +69,13 @@ async def encode(frames_dir: Path):
     )
 
     async def _feed():
-        async for frame in frames(frames_dir):
+        async for frame in _frames(frames_dir):
             encoder_process.stdin.write(frame.tobytes())
 
     async def _print():
-        async for atom_type, _ in atoms(encoder_process.stdout):
+        async for atom_type, _ in _atoms(encoder_process.stdout):
             print(atom_type)
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(_feed())
         tg.create_task(_print())
-
-if __name__ == "__main__":
-    asyncio.run(encode(Path("./frames")))
