@@ -1,10 +1,12 @@
 import asyncio
+import json
 import os
+import shutil
 import time
-from datetime import timedelta
+from asyncio import subprocess
+from datetime import timedelta, datetime
 from pathlib import Path
-from subprocess import Popen, PIPE
-from typing import AsyncIterator, IO
+from typing import AsyncIterator
 
 import numpy as np
 from PIL import Image
@@ -13,7 +15,6 @@ DESIRED_FPS: int = 30
 FRAMES_PER_KEYFRAME: int = 30
 H264_CRF: int = 35
 _ENCODER_CMD = [
-    "ffmpeg",
     "-r", f"{DESIRED_FPS}",
 
     "-f", "rawvideo",
@@ -36,46 +37,80 @@ _ENCODER_CMD = [
 ]
 
 
-async def _frames(frames_dir: Path) -> AsyncIterator[np.ndarray]:
+async def _frames(frames_dir: Path) -> AsyncIterator[tuple[np.ndarray, str, timedelta]]:
 
     frame_names = sorted(os.listdir(frames_dir))
     delta = timedelta(seconds=1 / DESIRED_FPS)
+    start_time = datetime.now()
 
     while True:
         for frame_name in frame_names:
             then = timedelta(seconds=time.perf_counter())
-            yield np.asarray(Image.open(frames_dir / frame_name))
+            yield np.asarray(Image.open(frames_dir / frame_name)), frame_name, datetime.now() - start_time
 
             elapsed = timedelta(seconds=time.perf_counter()) - then
             if elapsed < delta:
                 await asyncio.sleep((delta - elapsed).total_seconds())
 
 
-async def _atoms(output: IO) -> AsyncIterator[tuple[bytes, bytes]]:
-    while output.readable():
-        atom_size_bytes, atom_type = await asyncio.to_thread(output.read, 4), await asyncio.to_thread(output.read, 4)
+async def _atoms(output: asyncio.StreamReader) -> AsyncIterator[tuple[bytes, bytes]]:
+    while not output.at_eof():
+        atom_size_bytes, atom_type = await output.readexactly(4), await output.readexactly(4)
         atom_size = int.from_bytes(atom_size_bytes, "big")
-        atom_data = atom_size_bytes + atom_type + await asyncio.to_thread(output.read, atom_size - 8)
+        atom_data = atom_size_bytes + atom_type + await output.readexactly(atom_size - 8)
 
         yield atom_type, atom_data
 
 
 async def encode(frames_dir: Path):
 
-    encoder_process = Popen(
-        _ENCODER_CMD,
-        stdin=PIPE,
-        stdout=PIPE,
+    encoder_process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        *_ENCODER_CMD,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE
     )
+    meta: dict[float, str] = {}
 
     async def _feed():
-        async for frame in _frames(frames_dir):
+        async for frame, metadata, ts in _frames(frames_dir):
             encoder_process.stdin.write(frame.tobytes())
+            meta[ts.total_seconds()] = metadata
 
-    async def _print():
-        async for atom_type, _ in _atoms(encoder_process.stdout):
-            print(atom_type)
+    async def _store():
+
+        chunks_dir = Path("./chunks")
+        if chunks_dir.exists():
+            shutil.rmtree(chunks_dir)
+        chunks_dir.mkdir()
+
+        atoms = _atoms(encoder_process.stdout)
+
+        with (chunks_dir / "init.m4s").open("wb") as _init_chunk:
+            for init_atom_type in (b"ftyp", b"moov"):
+                atom_type, atom_data = await anext(atoms)
+                assert atom_type == init_atom_type,\
+                    f"received unexpected atom '{atom_type}' while expecting '{init_atom_type}"
+                _init_chunk.write(atom_data)
+
+        with (chunks_dir / "media.mp4").open("wb") as _media_chunk, (chunks_dir / "meta.txt").open("w") as _meta_chunk:
+            while not encoder_process.stdout.at_eof():
+                for media_atom_type in (b"moof", b"mdat"):
+                    atom_type, atom_data = await anext(atoms)
+                    assert atom_type == media_atom_type, \
+                        f"received unexpected atom '{atom_type}' while expecting '{media_atom_type}"
+
+                    _media_chunk.write(atom_data)
+
+                _meta_chunk.write(json.dumps(meta))
+                _meta_chunk.flush()
+                meta.clear()
+                _media_chunk.flush()
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(_feed())
-        tg.create_task(_print())
+        tg.create_task(_store())
+
+
+if __name__ == "__main__":
+    asyncio.run(encode(Path("./frames")))

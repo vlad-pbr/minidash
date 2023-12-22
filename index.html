@@ -1,0 +1,85 @@
+<html>
+    <head>
+        <title>Browser native streaming</title>
+    </head>
+    <body>
+        <table>
+            <tr>
+                <td><h1>MPEG-4</h1></td>
+            </tr>
+            <tr>
+                <td>
+                    <video id="video" height="480" width="720" autoplay muted></video>
+                </td>
+            </tr>
+        </table>
+        <h1>
+            <div id="time"></div>
+        </h1>
+        <script>
+
+            // store HTML elements
+            let video = document.getElementById("video")
+            let time = document.getElementById("time")
+
+            // add metadata track
+            let track = video.addTextTrack("metadata", "annotations", "en")
+            track.oncuechange = (e) => {
+                cue = e.target.activeCues[0]
+                if (cue) {
+                    console.log(cue.text)
+                }
+            } 
+
+            // dynamically update real time
+            setInterval(() => {
+                time.textContent = `Time: ${new Date().toLocaleString()}`
+            }, 100)
+
+            let ws = undefined
+            function establishVideo() {
+
+                // prepare video source
+                let mediaSource = new MediaSource()
+                video.src = window.URL.createObjectURL(mediaSource)
+                mediaSource.onsourceopen = (e) => {
+
+                    // prepare video source buffer
+                    const sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42c020"')
+                    sourceBuffer.mode = "sequence"       
+
+                    // receive video and metadata via websocket
+                    ws = new WebSocket(`ws://${window.location.host}/live`)
+                    ws.binaryType = "arraybuffer"
+                    let startTime = null
+                    ws.onmessage = (e) => {
+                        if (e.data instanceof ArrayBuffer) {
+                            sourceBuffer.appendBuffer(e.data)
+                        } else {
+                            for (const [k, v] of Object.entries(JSON.parse(e.data))) {
+                                if (startTime === null) {
+                                    startTime = k
+                                }
+                                track.addCue(new VTTCue(k - startTime, k - startTime+0.001, v))
+                            }
+                        }
+                    }
+
+                }
+            }
+
+            // reset video when user leaves the tab
+            document.onvisibilitychange = (e) => {
+                if (document.hidden) {
+                    if (ws instanceof WebSocket) {
+                        ws.close()
+                        ws = undefined
+                    }
+                } else {
+                    establishVideo()
+                }
+            }
+            establishVideo()
+        </script>
+    </body>
+</html>
